@@ -79,8 +79,8 @@ def _extract_balanced_object(text: str, start_idx: int) -> str:
 
 
 def _js_object_to_json(js: str) -> str:
-    # quote bare identifier keys: {key: or ,key:
-    js = re.sub(r"([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*:", r'\1"\2":', js)
+    # quote bare identifier or numeric keys: {key: ,key: {3: ,24:
+    js = re.sub(r"([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*|\d+)\s*:", r'\1"\2":', js)
     # webpack-minified booleans
     js = js.replace("!0", "true").replace("!1", "false")
     js = re.sub(r":\s*undefined", ": null", js)
@@ -121,6 +121,41 @@ def _parse_rupees(value: Any) -> int | None:
     return int(digits) if digits else None
 
 
+def _normalize_buyback(raw: Any) -> dict:
+    """Spinny's `buy_back_pricing` is either null (no assured buyback on this
+    listing) or a dict keyed by month-held (as a number, e.g. 3, 12, 24) with
+    {"monthly": <monthly payout alt>, "value": <lump buyback value>} per key,
+    plus one or more flat one-time '<duration>_buyback_cost' enrollment-fee
+    fields and an 'availability' flag."""
+    schedule: dict[int, dict] = {}
+    plan_cost = None
+
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(value, dict) and ("value" in value or "monthly" in value):
+                try:
+                    month = int(key)
+                except (TypeError, ValueError):
+                    continue
+                schedule[month] = {
+                    "monthly": value.get("monthly"),
+                    "value": value.get("value"),
+                }
+            elif isinstance(key, str) and key.endswith("buyback_cost"):
+                if isinstance(value, (int, float)):
+                    plan_cost = value
+
+    has_values = any(v.get("value") for v in schedule.values())
+    available = bool(raw) and has_values and raw.get("availability", True) is not False
+
+    return {
+        "available": available,
+        "schedule": schedule,
+        "plan_cost": plan_cost,
+        "raw": raw,
+    }
+
+
 def scrape_spinny_listing(url: str) -> dict:
     if not is_spinny_url(url):
         raise ScrapeError("That doesn't look like a spinny.com URL")
@@ -135,8 +170,7 @@ def scrape_spinny_listing(url: str) -> dict:
     listing_price = _parse_rupees((pricing.get("listing_price") or {}).get("price"))
     market_price = _parse_rupees((pricing.get("market_price") or {}).get("price"))
 
-    buyback_raw = pd.get("buy_back_pricing") or pricing.get("buyback_pricing")
-    buyback_available = buyback_raw is not None
+    buyback = _normalize_buyback(pd.get("buy_back_pricing"))
 
     servicing = pricing.get("servicing_package") or {}
     rsa = pricing.get("rsa_pricing") or {}
@@ -184,10 +218,7 @@ def scrape_spinny_listing(url: str) -> dict:
             "tenure_years_max": loan_age.get("max"),
             "max_ltv_percent": finance_best.get("max_ltv"),
         },
-        "buyback": {
-            "available": buyback_available,
-            "raw": buyback_raw,
-        },
+        "buyback": buyback,
         "maintenance": {
             "service_1yr": servicing.get("1_year"),
             "service_2yr": servicing.get("2_year"),

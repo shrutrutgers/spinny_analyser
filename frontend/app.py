@@ -19,23 +19,19 @@ def get_backend_url() -> str:
 BACKEND_URL = get_backend_url()
 
 
-def coerce_buyback_amount(raw, price: int) -> int:
-    """Best-effort numeric value out of whatever shape Spinny's
-    buyback_pricing field has for listings where it's populated."""
-    if raw is None:
-        return int(price * 0.45)
-    if isinstance(raw, (int, float)):
-        return int(raw)
-    if isinstance(raw, dict):
-        for key in ("price", "value", "amount", "buyback_price"):
-            v = raw.get(key)
-            if isinstance(v, (int, float)):
-                return int(v)
-            if isinstance(v, str):
-                digits = "".join(ch for ch in v if ch.isdigit())
-                if digits:
-                    return int(digits)
-    return int(price * 0.45)
+def pick_buyback_value(schedule: dict, hold_months: int, price: int) -> tuple[int, int | None]:
+    """Pick the scraped buyback value for the month closest to hold_months.
+    Returns (amount, matched_month). matched_month is None if the schedule
+    is empty (caller should fall back to a manual estimate)."""
+    candidates = {
+        int(month): entry["value"]
+        for month, entry in schedule.items()
+        if entry.get("value")
+    }
+    if not candidates:
+        return int(price * 0.45), None
+    closest_month = min(candidates, key=lambda m: abs(m - hold_months))
+    return int(candidates[closest_month]), closest_month
 
 
 st.set_page_config(page_title="Spinny Cost of Ownership", page_icon="🚗", layout="wide")
@@ -183,17 +179,39 @@ if data:
                 st.caption("No extended warranty pricing published for this car.")
 
     st.divider()
+    hold_months = st.slider("Ownership period (months)", 12, 36, 24, step=1)
+
     st.subheader("Assured buyback")
     if buyback["available"]:
-        st.success("Spinny has published an assured buyback figure for this car.")
+        default_amount, matched_month = pick_buyback_value(
+            buyback["schedule"], hold_months, price
+        )
+        if matched_month == hold_months:
+            st.success(
+                f"Spinny publishes an assured buyback value for this car at "
+                f"{matched_month} months: ₹{default_amount:,}."
+            )
+        else:
+            st.success(
+                f"Spinny publishes an assured buyback schedule for this car. "
+                f"The closest published point to {hold_months} months is "
+                f"{matched_month} months (₹{default_amount:,}) — adjust below if needed."
+            )
         buyback_amount = st.number_input(
             "Assured buyback amount used in calculation (₹)",
             min_value=0,
-            value=coerce_buyback_amount(buyback["raw"], price),
+            value=default_amount,
             step=1000,
         )
-        with st.expander("Raw scraped buyback data"):
-            st.json(buyback["raw"])
+        include_plan_cost = False
+        plan_cost = buyback["plan_cost"] or 0
+        if plan_cost:
+            include_plan_cost = st.checkbox(
+                f"Include Spinny's buyback plan enrollment fee (₹{plan_cost:,.0f})",
+                value=True,
+            )
+        with st.expander("Full scraped buyback schedule"):
+            st.json(buyback["schedule"])
     else:
         st.warning(
             "Spinny hasn't published an assured buyback figure for this specific "
@@ -208,8 +226,8 @@ if data:
         )
         buyback_amount = int(price * buyback_pct / 100)
         st.caption(f"Estimated buyback amount: ₹{buyback_amount:,}")
-
-    hold_months = st.slider("Ownership period (months)", 12, 36, 24, step=1)
+        include_plan_cost = False
+        plan_cost = 0
 
     months_financed = min(hold_months, tenure_months) if tenure_months else 0
     total_emi_paid = emi * months_financed
@@ -221,6 +239,8 @@ if data:
         total_cost += rsa_cost
     if include_warranty:
         total_cost += warranty_cost
+    if include_plan_cost:
+        total_cost += plan_cost
 
     net_cost = total_cost - buyback_amount
 
@@ -259,6 +279,9 @@ if data:
     if include_warranty and warranty_cost:
         chart_labels.append("Extended warranty")
         chart_values.append(warranty_cost)
+    if include_plan_cost and plan_cost:
+        chart_labels.append("Buyback plan fee")
+        chart_values.append(plan_cost)
     chart_labels.append("Buyback credit")
     chart_values.append(-buyback_amount)
     chart_labels.append("Net cost")
